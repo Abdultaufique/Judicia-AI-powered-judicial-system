@@ -7,7 +7,7 @@ import axios from "axios";
  */
 const API_BASE =
     import.meta.env.VITE_API_URL ||
-    "https://c557-49-248-160-250.ngrok-free.app";
+    "http://localhost:8000";
 
 // -------------------- ANALYZE PDF --------------------
 export const analyzeDocument = async (file, onProgress) => {

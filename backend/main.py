@@ -15,14 +15,17 @@ import re
 import PyPDF2
 from dotenv import load_dotenv
 
+# Fix Windows emoji encoding issue
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from langchain_ollama import ChatOllama
+from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.tools import DuckDuckGoSearchResults
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.messages import HumanMessage
 
@@ -91,11 +94,18 @@ search_tool = DuckDuckGoSearchResults(max_results=5)
 # --------------------------------------------------
 # VECTOR DB (RAG)
 # --------------------------------------------------
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+# Use OllamaEmbeddings — no torch/GPU required, uses already-running Ollama
+try:
+    embeddings = OllamaEmbeddings(model="llama3.1", base_url="http://localhost:11434")
+    print("✅ Ollama Embeddings ready")
+except Exception as e:
+    embeddings = None
+    print("⚠️ Embeddings error:", e)
+
 VECTOR_PATH = os.path.join(BASE_DIR, "../data/vector_store")
 
 vector_db = None
-if os.path.exists(VECTOR_PATH):
+if embeddings and os.path.exists(VECTOR_PATH):
     try:
         vector_db = FAISS.load_local(
             VECTOR_PATH,
@@ -104,7 +114,7 @@ if os.path.exists(VECTOR_PATH):
         )
         print("✅ Vector DB loaded")
     except Exception as e:
-        print("⚠️ Vector DB error:", e)
+        print("⚠️ Vector DB not found (will work without RAG):", e)
 
 # --------------------------------------------------
 # DATA MODELS
