@@ -1,11 +1,11 @@
 """
-JUDICIAL AI BACKEND – GEMINI CLOUD VERSION
+JUDICIAL AI BACKEND — RENDER CLOUD VERSION
 ==========================================
-• Gemini 2.5 Flash via Google AI (free tier)
-• RAG with FAISS + Google Embeddings
+• Google Gemini 2.0 Flash via google-genai SDK (pure Python, no Rust)
 • 5-Agent Multi-Agent Reasoning Pipeline
-• DuckDuckGo Web Search
-• Deployable on Render.com (free tier)
+• DuckDuckGo Web Search (pure Python)
+• Zero LangChain / Zero compilation required
+• Compatible with Python 3.11–3.14+
 """
 
 import os
@@ -15,38 +15,31 @@ import re
 import PyPDF2
 from dotenv import load_dotenv
 
-# Fix Windows emoji encoding (no-op on Linux/Render)
+# Fix Windows emoji encoding (harmless on Linux/Render)
 if sys.platform == "win32":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import google.genai as genai
 
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage
-from ddgs import DDGS
+from agents import MultiAgentOrchestrator, LLMResponse
 
-
-# --------------------------------------------------
-# BASIC SETUP
-# --------------------------------------------------
+# ─── Setup ────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(BASE_DIR)
 load_dotenv()
 
-from agents import MultiAgentOrchestrator
-
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+GEMINI_MODEL   = "gemini-2.0-flash"
 
-# --------------------------------------------------
-# FASTAPI
-# --------------------------------------------------
+# ─── FastAPI App ──────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Judicial AI Backend",
-    version="3.0.0",
-    description="AI-powered legal judgment analysis — Gemini Cloud Edition"
+    title="Judicial AI — Gemini Cloud Backend",
+    version="4.0.0",
+    description="AI-powered legal judgment analysis using Gemini 2.0 Flash"
 )
 
 app.add_middleware(
@@ -56,129 +49,106 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --------------------------------------------------
-# GEMINI LLM (PRIMARY)
-# --------------------------------------------------
-llm = None
+# ─── Gemini Client ────────────────────────────────────────────────────────────
+gemini_client = None
 if GOOGLE_API_KEY:
     try:
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
-            temperature=0.3,
-            google_api_key=GOOGLE_API_KEY,
-            max_output_tokens=4096
+        gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
+        # Quick test
+        gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents="ping"
         )
-        # Quick connection test
-        llm.invoke([HumanMessage(content="hi")])
-        print("✅ Gemini 2.5 Flash connected")
+        print(f"[OK] Gemini {GEMINI_MODEL} connected")
     except Exception as e:
-        print("❌ Gemini error:", e)
-        llm = None
+        print(f"[ERR] Gemini connection failed: {e}")
+        gemini_client = None
 else:
-    print("❌ GOOGLE_API_KEY not set — set it in Render environment variables!")
+    print("[ERR] GOOGLE_API_KEY not set — add it in Render Environment Variables!")
 
-# --------------------------------------------------
-# GEMINI EMBEDDINGS — disabled on cloud (no local vector store)
-# --------------------------------------------------
-embeddings = None
-print("ℹ️  Embeddings disabled on cloud deployment (no local vector store)")
+# ─── LLM Wrapper ─────────────────────────────────────────────────────────────
+class GeminiLLM:
+    """Drop-in LLM wrapper using google-genai SDK directly"""
 
-# --------------------------------------------------
-# WEB SEARCH (DuckDuckGo via ddgs — no API key needed)
-# --------------------------------------------------
+    def __init__(self, client, model: str = GEMINI_MODEL):
+        self.client = client
+        self.model  = model
+
+    def invoke(self, prompt) -> LLMResponse:
+        # Accept both string and list-of-messages (from agents.py)
+        if isinstance(prompt, list):
+            text = "\n".join(
+                m.content if hasattr(m, "content") else str(m)
+                for m in prompt
+            )
+        else:
+            text = str(prompt)
+
+        try:
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=text
+            )
+            return LLMResponse(response.text or "")
+        except Exception as e:
+            return LLMResponse(f"[LLM Error: {str(e)}]")
+
+llm = GeminiLLM(gemini_client) if gemini_client else None
+
+# ─── DuckDuckGo Search ────────────────────────────────────────────────────────
 def ddg_search(query: str, max_results: int = 5) -> list:
-    """Direct DuckDuckGo search using ddgs library."""
+    """Pure Python DuckDuckGo search — no Rust required"""
     try:
+        from duckduckgo_search import DDGS
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
-            return results
+            return list(ddgs.text(query, max_results=max_results))
     except Exception as e:
-        print("⚠️ DuckDuckGo search error:", e)
+        print(f"[WARN] DuckDuckGo error: {e}")
         return []
 
-print("✅ DuckDuckGo Search ready (ddgs)")
-
-# --------------------------------------------------
-# VECTOR DB — disabled on cloud (no local data)
-# --------------------------------------------------
-vector_db = None  # RAG not available on cloud deployment
-
-
-# --------------------------------------------------
-# DATA MODELS
-# --------------------------------------------------
-class WebQuery(BaseModel):
-    query: str
-
-# --------------------------------------------------
-# HELPERS
-# --------------------------------------------------
-def extract_text_from_pdf(data: bytes) -> str:
-    try:
-        reader = PyPDF2.PdfReader(io.BytesIO(data))
-        text = ""
-        for page in reader.pages:
-            extracted = page.extract_text()
-            if extracted:
-                text += extracted + "\n"
-        return text[:12000]   # ~3000 tokens
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid or unreadable PDF file")
-
-def extract_urls(raw: str) -> list:
-    urls = re.findall(r'https?://[^\s,\]\'"]+', raw)
-    cleaned = []
-    for u in urls:
-        u = re.sub(r'[,\]\)\}\'\"]$', '', u)
-        if u.startswith("http") and len(u) > 20:
-            cleaned.append(u)
-    return cleaned[:5]
-
-# --------------------------------------------------
-# WEB SEARCH FUNCTION
-# --------------------------------------------------
 def web_search(query: str) -> dict:
     """
-    Returns: {"answer": str, "sources": [{"title": str, "url": str, "snippet": str}]}
+    Returns: {"answer": str, "sources": [{"title", "url", "snippet"}]}
     """
     try:
-        raw = ddg_search(query, max_results=5)
+        raw = ddg_search(query)
         if not raw:
             return {"answer": "No web sources found", "sources": []}
 
         sources = [
             {
-                "title": r.get("title", f"Legal Source {i+1}"),
-                "url": r.get("href", ""),
-                "snippet": r.get("body", "Relevant legal information")
+                "title":   r.get("title",  f"Legal Source {i+1}"),
+                "url":     r.get("href",   ""),
+                "snippet": r.get("body",   "")[:300]
             }
             for i, r in enumerate(raw) if r.get("href")
         ]
 
         if not sources:
-            return {"answer": "No usable web sources found", "sources": []}
+            return {"answer": "No usable sources found", "sources": []}
 
-        # Use Gemini to summarize if available
+        # Summarize with Gemini
         if llm:
-            snippets = "\n".join([f"- {s['title']}: {s['snippet'][:200]}" for s in sources])
-            prompt = f"""You are a legal research assistant.
-Query: {query}
-Search Results:
-{snippets}
-Provide a concise legal analysis (2 paragraphs max)."""
+            snippets = "\n".join([
+                f"- {s['title']}: {s['snippet']}" for s in sources[:3]
+            ])
+            prompt = (
+                f"You are a legal research assistant.\n"
+                f"Query: {query}\n"
+                f"Search results:\n{snippets}\n"
+                f"Write a 2-paragraph legal analysis."
+            )
             response = llm.invoke(prompt)
             answer = response.content.strip()
         else:
-            answer = f"Found {len(sources)} sources."
+            answer = f"Found {len(sources)} sources (Gemini not configured)."
 
         return {"answer": answer, "sources": sources}
 
     except Exception as e:
-        return {"answer": f"Web search error: {str(e)}", "sources": []}
+        return {"answer": f"Search error: {str(e)}", "sources": []}
 
-# --------------------------------------------------
-# MULTI-AGENT SYSTEM
-# --------------------------------------------------
+# ─── Multi-Agent System ───────────────────────────────────────────────────────
 multi_agent = None
 if llm:
     try:
@@ -186,109 +156,99 @@ if llm:
             llm=llm,
             web_search_function=web_search
         )
-        print("✅ 5-Agent pipeline initialized")
+        print("[OK] 5-Agent pipeline ready")
     except Exception as e:
-        print("❌ Multi-Agent failed:", e)
+        print(f"[ERR] Multi-Agent init failed: {e}")
 
-# --------------------------------------------------
-# CORE ANALYSIS
-# --------------------------------------------------
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+def extract_text_from_pdf(data: bytes) -> str:
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(data))
+        text = ""
+        for page in reader.pages:
+            t = page.extract_text()
+            if t:
+                text += t + "\n"
+        return text[:12000]
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid or unreadable PDF")
+
 def run_analysis(text: str) -> dict:
-    # RAG context retrieval
-    context = ""
-    if vector_db:
-        try:
-            docs = vector_db.similarity_search(text[:2000], k=3)
-            context = "\n".join(d.page_content for d in docs)
-        except Exception as e:
-            print("⚠️ RAG search error:", e)
-
     if not multi_agent:
         return {
-            "summary": "Backend not configured. Please set GOOGLE_API_KEY.",
+            "summary":  "Backend not configured — set GOOGLE_API_KEY in Render.",
             "analysis": "",
-            "laws": "",
+            "laws":     "",
             "web_sources": []
         }
+    return multi_agent.run(judgment_text=text, rag_context="")
 
-    return multi_agent.run(judgment_text=text, rag_context=context)
+# ─── API Endpoints ────────────────────────────────────────────────────────────
+class WebQuery(BaseModel):
+    query: str
 
-# --------------------------------------------------
-# API ENDPOINTS
-# --------------------------------------------------
 @app.post("/analyze")
 async def analyze_pdf(file: UploadFile = File(...)):
-    """Upload a legal judgment PDF for AI analysis."""
+    """Analyze a legal judgment PDF."""
     if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+        raise HTTPException(status_code=400, detail="Only PDF files supported")
 
     data = await file.read()
-    if len(data) > 20 * 1024 * 1024:  # 20MB limit
-        raise HTTPException(status_code=413, detail="PDF too large (max 20MB)")
+    if len(data) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="PDF too large (max 20 MB)")
 
     text = extract_text_from_pdf(data)
-    if len(text.strip()) < 100:
-        raise HTTPException(status_code=400, detail="PDF appears to be empty or unreadable")
+    if len(text.strip()) < 50:
+        raise HTTPException(status_code=400, detail="PDF is empty or unreadable")
 
     result = run_analysis(text)
-
     return {
-        "filename": file.filename,
-        "summary": result.get("summary", ""),
-        "laws": result.get("laws", ""),
-        "analysis": result.get("analysis", ""),
-        "web_sources": result.get("web_sources", []),
+        "filename":            file.filename,
+        "summary":             result.get("summary", ""),
+        "laws":                result.get("laws", ""),
+        "analysis":            result.get("analysis", ""),
+        "web_sources":         result.get("web_sources", []),
         "characters_processed": len(text)
     }
 
 @app.post("/web-search")
-def manual_web_search(query: WebQuery):
-    """Perform a legal web search query."""
+def manual_search(query: WebQuery):
+    """Run a legal web search."""
     return web_search(query.query)
 
 @app.get("/health")
 def health():
-    """Health check endpoint for Render."""
+    """Health check — used by Render."""
     return {
-        "status": "online",
-        "version": "3.0.0",
-        "llm": "gemini-2.5-flash" if llm else "not configured",
-        "gemini": bool(llm),
-        "embeddings": bool(embeddings),
-        "vector_db": bool(vector_db),
+        "status":      "online",
+        "version":     "4.0.0",
+        "gemini":      bool(gemini_client),
         "multi_agent": bool(multi_agent),
-        "web_search": bool(search_tool)
+        "model":       GEMINI_MODEL
     }
 
 @app.get("/")
 def root():
-    """Root endpoint."""
     return {
-        "message": "Judicial AI Backend v3.0 — Gemini Edition",
-        "docs": "/docs",
-        "health": "/health"
+        "message": "Judicial AI Backend v4.0 — Gemini Cloud",
+        "docs":    "/docs",
+        "health":  "/health"
     }
 
-# --------------------------------------------------
-# STARTUP EVENT
-# --------------------------------------------------
+# ─── Startup Log ──────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
-    print("\n" + "="*60)
-    print("  JUDICIAL AI BACKEND v3.0 — GEMINI CLOUD EDITION")
-    print("="*60)
-    print(f"  LLM:        {'Gemini 2.5 Flash' if llm else 'NOT CONFIGURED'}")
-    print(f"  Embeddings: {'Google text-embedding-004' if embeddings else 'Disabled'}")
-    print(f"  Vector DB:  {'FAISS loaded' if vector_db else 'Not loaded'}")
-    print(f"  Agents:     {'5-agent pipeline' if multi_agent else 'Not initialized'}")
-    print(f"  Web Search: {'DuckDuckGo active' if search_tool else 'Disabled'}")
-    print("="*60)
-    print("  API Docs: /docs")
-    print("="*60 + "\n")
+    sep = "=" * 55
+    print(f"\n{sep}")
+    print("  JUDICIAL AI BACKEND v4.0 — GEMINI CLOUD")
+    print(sep)
+    print(f"  Gemini:     {GEMINI_MODEL if gemini_client else 'NOT CONFIGURED'}")
+    print(f"  Agents:     {'5-agent pipeline active' if multi_agent else 'Not initialized'}")
+    print(f"  Web Search: DuckDuckGo (pure Python)")
+    print(f"  API Docs:   /docs")
+    print(f"{sep}\n")
 
-# --------------------------------------------------
-# RUN (local dev only — Render uses uvicorn directly)
-# --------------------------------------------------
+# ─── Local Dev Only ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))

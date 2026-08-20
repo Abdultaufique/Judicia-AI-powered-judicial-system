@@ -1,15 +1,16 @@
 services:
-  # ─── FastAPI Backend ──────────────────────────────────────────────────────────
   - type: web
     name: judicia-ai-backend
     runtime: python
-    region: singapore          # closest to India
+    region: singapore
     plan: free
-    buildCommand: pip install -r backend/requirements.txt
-    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    rootDir: backend
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: GOOGLE_API_KEY
-        sync: false            # you will set this manually in Render dashboard
+        sync: false
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: "3.11.6"
     healthCheckPath: /health
+    autoDeploy: true
