@@ -1,16 +1,32 @@
-# Environment
+# ─── Secrets ──────────────────────────────────────────────────────────────────
 .env
+backend/.env
+*.env
+
+# ─── Python ────────────────────────────────────────────────────────────────────
 venv/
-
-# Database
-*.db
-
-# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
 
-# RAG
+# ─── Node / Frontend ───────────────────────────────────────────────────────────
+node_modules/
+judicial-ai-react/dist/
+judicial-ai-react/.env.local
+
+# ─── Database & Vector Store ───────────────────────────────────────────────────
+*.db
+*.sqlite
 data/vector_store/
 
-# Node
-node_modules/
+# ─── OS / IDE ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
