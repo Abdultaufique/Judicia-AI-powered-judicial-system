@@ -1,45 +1,49 @@
 """
-JUDICIAL AI BACKEND — RENDER CLOUD VERSION
-==========================================
-• Google Gemini 2.0 Flash via google-genai SDK (pure Python, no Rust)
+JUDICIAL AI BACKEND — GEMINI REST API DIRECT
+============================================
+• Calls Gemini API directly via httpx (no SDK, no grpcio, no Rust)
 • 5-Agent Multi-Agent Reasoning Pipeline
-• DuckDuckGo Web Search (pure Python)
-• Zero LangChain / Zero compilation required
-• Compatible with Python 3.11–3.14+
+• DuckDuckGo Web Search (raw httpx)
+• Zero external AI dependencies
+• Works on Python 3.8–3.14+, any platform
 """
 
 import os
 import io
 import sys
 import re
+import json
+import httpx
 import PyPDF2
 from dotenv import load_dotenv
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-# Fix Windows emoji encoding (harmless on Linux/Render)
+# Fix Windows encoding (no-op on Linux/Render)
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import google.genai as genai
-
 from agents import MultiAgentOrchestrator, LLMResponse
 
-# ─── Setup ────────────────────────────────────────────────────────────────────
+# ─── Config ───────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(BASE_DIR)
 load_dotenv()
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-GEMINI_MODEL   = "gemini-1.5-flash-002"
+GEMINI_MODEL   = "gemini-1.5-flash"     # Available in v1beta REST API
+GEMINI_URL     = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
 
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Judicial AI — Gemini Cloud Backend",
-    version="4.0.0",
-    description="AI-powered legal judgment analysis using Gemini 2.0 Flash"
+    title="Judicial AI — Gemini REST Backend",
+    version="5.0.0",
+    description="AI-powered legal analysis via Gemini REST API"
 )
 
 app.add_middleware(
@@ -49,25 +53,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Gemini Client (lazy — no startup ping) ──────────────────────────────────
-gemini_client = None
-if GOOGLE_API_KEY:
-    try:
-        gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
-        print(f"[OK] Gemini client created ({GEMINI_MODEL})")
-    except Exception as e:
-        print(f"[ERR] Gemini client init failed: {e}")
-        gemini_client = None
-else:
-    print("[ERR] GOOGLE_API_KEY not set!")
+# ─── Gemini REST Client ───────────────────────────────────────────────────────
+class GeminiRESTClient:
+    """
+    Calls Gemini via direct REST API — no SDK needed.
+    Uses: https://generativelanguage.googleapis.com/v1beta/models/...
+    Compatible with all AI Studio API keys.
+    """
 
-# ─── LLM Wrapper ─────────────────────────────────────────────────────────────
+    def __init__(self, api_key: str, model: str = GEMINI_MODEL):
+        self.api_key = api_key
+        self.model   = model
+        self.url     = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent"
+        )
+
+    def generate(self, prompt: str) -> str:
+        payload = {
+            "contents": [
+                {"parts": [{"text": prompt}]}
+            ],
+            "generationConfig": {
+                "temperature": 0.3,
+                "maxOutputTokens": 4096
+            }
+        }
+        try:
+            resp = httpx.post(
+                self.url,
+                json=payload,
+                params={"key": self.api_key},
+                headers={"Content-Type": "application/json"},
+                timeout=120.0
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(f"Gemini API error {e.response.status_code}: {e.response.text}")
+        except Exception as e:
+            raise RuntimeError(f"Gemini request failed: {str(e)}")
+
+
+# ─── LLM Wrapper (compatible with agents.py) ─────────────────────────────────
 class GeminiLLM:
-    """Drop-in LLM wrapper using google-genai SDK directly"""
+    """Wraps GeminiRESTClient with agents.py-compatible .invoke() interface"""
 
-    def __init__(self, client, model: str = GEMINI_MODEL):
+    def __init__(self, client: GeminiRESTClient):
         self.client = client
-        self.model  = model
 
     def invoke(self, prompt) -> LLMResponse:
         if isinstance(prompt, list):
@@ -79,37 +113,39 @@ class GeminiLLM:
             text = str(prompt)
 
         try:
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents=text
-            )
-            return LLMResponse(response.text or "")
+            result = self.client.generate(text)
+            return LLMResponse(result)
         except Exception as e:
             return LLMResponse(f"[LLM Error: {str(e)}]")
 
-llm = GeminiLLM(gemini_client) if gemini_client else None
 
-# ─── DuckDuckGo Search (raw httpx — zero extra packages) ──────────────────────
+# ─── Initialize ───────────────────────────────────────────────────────────────
+gemini_rest = None
+llm         = None
+
+if GOOGLE_API_KEY:
+    gemini_rest = GeminiRESTClient(api_key=GOOGLE_API_KEY, model=GEMINI_MODEL)
+    llm = GeminiLLM(gemini_rest)
+    print(f"[OK] Gemini REST client ready ({GEMINI_MODEL})")
+else:
+    print("[ERR] GOOGLE_API_KEY not set in Render Environment Variables!")
+
+# ─── DuckDuckGo Search (raw httpx) ───────────────────────────────────────────
 def ddg_search(query: str, max_results: int = 5) -> list:
-    """
-    Calls DuckDuckGo Lite HTML endpoint directly using httpx.
-    Returns list of {title, href, body} dicts.
-    """
+    """Direct DuckDuckGo Lite HTML scrape via httpx"""
     try:
-        import httpx, re as _re
         resp = httpx.post(
             "https://html.duckduckgo.com/html/",
             data={"q": query, "b": ""},
-            headers={"User-Agent": "Mozilla/5.0 (compatible; JudiciaAI/4.0)"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; JudiciaAI/5.0)"},
             timeout=10.0,
             follow_redirects=True
         )
-        # Parse results from HTML
-        results = []
-        titles   = _re.findall(r'class="result__a"[^>]*>([^<]+)</a>', resp.text)
-        urls     = _re.findall(r'class="result__url"[^>]*>\s*([^\s<]+)', resp.text)
-        snippets = _re.findall(r'class="result__snippet"[^>]*>([^<]+)</a>', resp.text)
+        titles   = re.findall(r'class="result__a"[^>]*>([^<]+)</a>', resp.text)
+        urls     = re.findall(r'class="result__url"[^>]*>\s*([^\s<]+)', resp.text)
+        snippets = re.findall(r'class="result__snippet"[^>]*>([^<]+)</a>', resp.text)
 
+        results = []
         for i in range(min(max_results, len(titles), len(urls))):
             results.append({
                 "title": titles[i].strip(),
@@ -118,13 +154,12 @@ def ddg_search(query: str, max_results: int = 5) -> list:
             })
         return results
     except Exception as e:
-        print(f"[WARN] DuckDuckGo search error: {e}")
+        print(f"[WARN] DDG search error: {e}")
         return []
 
+
 def web_search(query: str) -> dict:
-    """
-    Returns: {"answer": str, "sources": [{"title", "url", "snippet"}]}
-    """
+    """Returns {answer, sources} dict"""
     try:
         raw = ddg_search(query)
         if not raw:
@@ -132,7 +167,7 @@ def web_search(query: str) -> dict:
 
         sources = [
             {
-                "title":   r.get("title",  f"Legal Source {i+1}"),
+                "title":   r.get("title",  f"Source {i+1}"),
                 "url":     r.get("href",   ""),
                 "snippet": r.get("body",   "")[:300]
             }
@@ -142,26 +177,24 @@ def web_search(query: str) -> dict:
         if not sources:
             return {"answer": "No usable sources found", "sources": []}
 
-        # Summarize with Gemini
         if llm:
-            snippets = "\n".join([
+            snippets_text = "\n".join([
                 f"- {s['title']}: {s['snippet']}" for s in sources[:3]
             ])
             prompt = (
-                f"You are a legal research assistant.\n"
-                f"Query: {query}\n"
-                f"Search results:\n{snippets}\n"
-                f"Write a 2-paragraph legal analysis."
+                f"Legal research query: {query}\n"
+                f"Search results:\n{snippets_text}\n"
+                f"Provide a concise 2-paragraph legal analysis."
             )
-            response = llm.invoke(prompt)
-            answer = response.content.strip()
+            answer = llm.invoke(prompt).content.strip()
         else:
-            answer = f"Found {len(sources)} sources (Gemini not configured)."
+            answer = f"Found {len(sources)} sources."
 
         return {"answer": answer, "sources": sources}
 
     except Exception as e:
         return {"answer": f"Search error: {str(e)}", "sources": []}
+
 
 # ─── Multi-Agent System ───────────────────────────────────────────────────────
 multi_agent = None
@@ -174,6 +207,7 @@ if llm:
         print("[OK] 5-Agent pipeline ready")
     except Exception as e:
         print(f"[ERR] Multi-Agent init failed: {e}")
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def extract_text_from_pdf(data: bytes) -> str:
@@ -188,19 +222,22 @@ def extract_text_from_pdf(data: bytes) -> str:
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid or unreadable PDF")
 
+
 def run_analysis(text: str) -> dict:
     if not multi_agent:
         return {
-            "summary":  "Backend not configured — set GOOGLE_API_KEY in Render.",
-            "analysis": "",
-            "laws":     "",
+            "summary":     "Backend not configured — set GOOGLE_API_KEY in Render.",
+            "analysis":    "",
+            "laws":        "",
             "web_sources": []
         }
     return multi_agent.run(judgment_text=text, rag_context="")
 
+
 # ─── API Endpoints ────────────────────────────────────────────────────────────
 class WebQuery(BaseModel):
     query: str
+
 
 @app.post("/analyze")
 async def analyze_pdf(file: UploadFile = File(...)):
@@ -218,50 +255,57 @@ async def analyze_pdf(file: UploadFile = File(...)):
 
     result = run_analysis(text)
     return {
-        "filename":            file.filename,
-        "summary":             result.get("summary", ""),
-        "laws":                result.get("laws", ""),
-        "analysis":            result.get("analysis", ""),
-        "web_sources":         result.get("web_sources", []),
+        "filename":             file.filename,
+        "summary":              result.get("summary", ""),
+        "laws":                 result.get("laws", ""),
+        "analysis":             result.get("analysis", ""),
+        "web_sources":          result.get("web_sources", []),
         "characters_processed": len(text)
     }
+
 
 @app.post("/web-search")
 def manual_search(query: WebQuery):
     """Run a legal web search."""
     return web_search(query.query)
 
+
 @app.get("/health")
 def health():
     """Health check — used by Render."""
     return {
         "status":      "online",
-        "version":     "4.0.0",
-        "gemini":      bool(gemini_client),
+        "version":     "5.0.0",
+        "gemini":      bool(gemini_rest),
         "multi_agent": bool(multi_agent),
-        "model":       GEMINI_MODEL
+        "model":       GEMINI_MODEL,
+        "api_type":    "REST (direct)"
     }
+
 
 @app.get("/")
 def root():
     return {
-        "message": "Judicial AI Backend v4.0 — Gemini Cloud",
+        "message": "Judicial AI Backend v5.0 — Gemini REST Direct",
         "docs":    "/docs",
         "health":  "/health"
     }
+
 
 # ─── Startup Log ──────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     sep = "=" * 55
     print(f"\n{sep}")
-    print("  JUDICIAL AI BACKEND v4.0 — GEMINI CLOUD")
+    print("  JUDICIAL AI BACKEND v5.0 — GEMINI REST DIRECT")
     print(sep)
-    print(f"  Gemini:     {GEMINI_MODEL if gemini_client else 'NOT CONFIGURED'}")
+    print(f"  Gemini:     {GEMINI_MODEL if gemini_rest else 'NOT CONFIGURED'}")
+    print(f"  API Type:   Direct REST (no SDK)")
     print(f"  Agents:     {'5-agent pipeline active' if multi_agent else 'Not initialized'}")
-    print(f"  Web Search: DuckDuckGo (pure Python)")
+    print(f"  Web Search: DuckDuckGo (raw httpx)")
     print(f"  API Docs:   /docs")
     print(f"{sep}\n")
+
 
 # ─── Local Dev Only ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
