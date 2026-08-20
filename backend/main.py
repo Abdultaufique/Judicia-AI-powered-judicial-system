@@ -95,15 +95,36 @@ class GeminiLLM:
 
 llm = GeminiLLM(gemini_client) if gemini_client else None
 
-# ─── DuckDuckGo Search ────────────────────────────────────────────────────────
+# ─── DuckDuckGo Search (raw httpx — zero extra packages) ──────────────────────
 def ddg_search(query: str, max_results: int = 5) -> list:
-    """Pure Python DuckDuckGo search — no Rust required"""
+    """
+    Calls DuckDuckGo Lite HTML endpoint directly using httpx.
+    Returns list of {title, href, body} dicts.
+    """
     try:
-        from duckduckgo_search import DDGS
-        with DDGS() as ddgs:
-            return list(ddgs.text(query, max_results=max_results))
+        import httpx, re as _re
+        resp = httpx.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query, "b": ""},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; JudiciaAI/4.0)"},
+            timeout=10.0,
+            follow_redirects=True
+        )
+        # Parse results from HTML
+        results = []
+        titles   = _re.findall(r'class="result__a"[^>]*>([^<]+)</a>', resp.text)
+        urls     = _re.findall(r'class="result__url"[^>]*>\s*([^\s<]+)', resp.text)
+        snippets = _re.findall(r'class="result__snippet"[^>]*>([^<]+)</a>', resp.text)
+
+        for i in range(min(max_results, len(titles), len(urls))):
+            results.append({
+                "title": titles[i].strip(),
+                "href":  "https://" + urls[i].strip().lstrip("https://"),
+                "body":  snippets[i].strip() if i < len(snippets) else ""
+            })
+        return results
     except Exception as e:
-        print(f"[WARN] DuckDuckGo error: {e}")
+        print(f"[WARN] DuckDuckGo search error: {e}")
         return []
 
 def web_search(query: str) -> dict:
