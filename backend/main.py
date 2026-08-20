@@ -24,17 +24,10 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 from ddgs import DDGS
 
-# FAISS vector store (optional — only loaded if vector_store exists)
-try:
-    from langchain_community.vectorstores import FAISS
-    FAISS_AVAILABLE = True
-except ImportError:
-    FAISS_AVAILABLE = False
-    print("ℹ️  FAISS not available — RAG disabled")
 
 # --------------------------------------------------
 # BASIC SETUP
@@ -85,18 +78,10 @@ else:
     print("❌ GOOGLE_API_KEY not set — set it in Render environment variables!")
 
 # --------------------------------------------------
-# GEMINI EMBEDDINGS (for RAG)
+# GEMINI EMBEDDINGS — disabled on cloud (no local vector store)
 # --------------------------------------------------
 embeddings = None
-if GOOGLE_API_KEY:
-    try:
-        embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004",
-            google_api_key=GOOGLE_API_KEY
-        )
-        print("✅ Google Embeddings ready (text-embedding-004)")
-    except Exception as e:
-        print("⚠️ Embeddings error:", e)
+print("ℹ️  Embeddings disabled on cloud deployment (no local vector store)")
 
 # --------------------------------------------------
 # WEB SEARCH (DuckDuckGo via ddgs — no API key needed)
@@ -114,22 +99,10 @@ def ddg_search(query: str, max_results: int = 5) -> list:
 print("✅ DuckDuckGo Search ready (ddgs)")
 
 # --------------------------------------------------
-# VECTOR DB (RAG) — optional, skip if not built
+# VECTOR DB — disabled on cloud (no local data)
 # --------------------------------------------------
-VECTOR_PATH = os.path.join(BASE_DIR, "../data/vector_store")
-vector_db = None
-if embeddings and os.path.exists(VECTOR_PATH):
-    try:
-        vector_db = FAISS.load_local(
-            VECTOR_PATH,
-            embeddings,
-            allow_dangerous_deserialization=True
-        )
-        print("✅ FAISS Vector DB loaded")
-    except Exception as e:
-        print("⚠️ Vector DB not found — running without RAG:", e)
-else:
-    print("ℹ️  No vector DB found — RAG disabled (still fully functional)")
+vector_db = None  # RAG not available on cloud deployment
+
 
 # --------------------------------------------------
 # DATA MODELS
