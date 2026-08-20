@@ -1,10 +1,11 @@
 """
-JUDICIAL AI BACKEND — DYNAMIC GEMINI REST API & 5-AGENT SYSTEM
-==============================================================
+JUDICIAL AI BACKEND — DYNAMIC GEMINI REST API & 5-AGENT SYSTEM + RAG
+=====================================================================
 • Calls Gemini API directly via httpx (no SDK, no Rust/C++ builds)
 • Auto-discovers and auto-verifies working models from Google API
 • Dynamic automatic failover across models (2.0-flash, 1.5-flash-002, 1.5-pro, etc.)
 • 5-Agent Multi-Agent Reasoning Pipeline
+• RAG: TF-IDF retrieval from Indian laws & precedents knowledge base
 • Real-time DuckDuckGo Web Research
 • Lightweight SQLite History persistence (zero external dependencies)
 • Works on Python 3.8–3.14+, any platform (Render / Linux / Windows / macOS)
@@ -32,6 +33,7 @@ if sys.platform == "win32":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 from agents import MultiAgentOrchestrator, LLMResponse
+from rag_utils import LightweightRAG
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -55,9 +57,23 @@ def init_db():
                 laws TEXT,
                 analysis TEXT,
                 web_sources TEXT,
-                characters_processed INTEGER DEFAULT 0
+                characters_processed INTEGER DEFAULT 0,
+                precedents TEXT,
+                logic_audit TEXT,
+                rag_sources TEXT
             )
         """)
+        conn.commit()
+
+        # Migration: Add new columns to existing DB if they don't exist
+        existing_cols = [row[1] for row in cursor.execute("PRAGMA table_info(analyses)").fetchall()]
+        for col_name, col_type in [("precedents", "TEXT"), ("logic_audit", "TEXT"), ("rag_sources", "TEXT")]:
+            if col_name not in existing_cols:
+                try:
+                    cursor.execute(f"ALTER TABLE analyses ADD COLUMN {col_name} {col_type}")
+                    print(f"[DB] Added column: {col_name}")
+                except Exception:
+                    pass
         conn.commit()
         conn.close()
     except Exception as e:
@@ -65,16 +81,21 @@ def init_db():
 
 init_db()
 
-def save_analysis_record(filename: str, summary: str, laws: str, analysis: str, web_sources: list, char_count: int) -> int:
+def save_analysis_record(
+    filename: str, summary: str, laws: str, analysis: str,
+    web_sources: list, char_count: int,
+    precedents: str = "", logic_audit: str = "", rag_sources: list = None
+) -> int:
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         now = datetime.datetime.utcnow().isoformat() + "Z"
         sources_json = json.dumps(web_sources)
+        rag_json = json.dumps(rag_sources or [])
         cursor.execute("""
-            INSERT INTO analyses (filename, upload_date, summary, laws, analysis, web_sources, characters_processed)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (filename, now, summary, laws, analysis, sources_json, char_count))
+            INSERT INTO analyses (filename, upload_date, summary, laws, analysis, web_sources, characters_processed, precedents, logic_audit, rag_sources)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (filename, now, summary, laws, analysis, sources_json, char_count, precedents, logic_audit, rag_json))
         record_id = cursor.lastrowid
         conn.commit()
         conn.close()
@@ -89,7 +110,8 @@ def fetch_history_records(limit: int = 50) -> list:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT id, filename, upload_date, summary, laws, analysis, web_sources, characters_processed
+            SELECT id, filename, upload_date, summary, laws, analysis, web_sources, characters_processed,
+                   precedents, logic_audit, rag_sources
             FROM analyses
             ORDER BY id DESC
             LIMIT ?
@@ -102,6 +124,11 @@ def fetch_history_records(limit: int = 50) -> list:
                 sources = json.loads(r["web_sources"]) if r["web_sources"] else []
             except Exception:
                 sources = []
+            rag_src = []
+            try:
+                rag_src = json.loads(r["rag_sources"]) if r["rag_sources"] else []
+            except Exception:
+                rag_src = []
             results.append({
                 "id": r["id"],
                 "filename": r["filename"],
@@ -109,7 +136,10 @@ def fetch_history_records(limit: int = 50) -> list:
                 "summary": r["summary"] or "",
                 "laws": r["laws"] or "",
                 "analysis": r["analysis"] or "",
+                "precedents": r["precedents"] or "",
+                "logic_audit": r["logic_audit"] or "",
                 "web_sources": sources,
+                "rag_sources": rag_src,
                 "characters_processed": r["characters_processed"] or 0
             })
         conn.close()
@@ -124,7 +154,8 @@ def fetch_analysis_by_id(record_id: int) -> Optional[dict]:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT id, filename, upload_date, summary, laws, analysis, web_sources, characters_processed
+            SELECT id, filename, upload_date, summary, laws, analysis, web_sources, characters_processed,
+                   precedents, logic_audit, rag_sources
             FROM analyses
             WHERE id = ?
         """, (record_id,))
@@ -137,6 +168,11 @@ def fetch_analysis_by_id(record_id: int) -> Optional[dict]:
             sources = json.loads(row["web_sources"]) if row["web_sources"] else []
         except Exception:
             sources = []
+        rag_src = []
+        try:
+            rag_src = json.loads(row["rag_sources"]) if row["rag_sources"] else []
+        except Exception:
+            rag_src = []
         return {
             "id": row["id"],
             "filename": row["filename"],
@@ -144,7 +180,10 @@ def fetch_analysis_by_id(record_id: int) -> Optional[dict]:
             "summary": row["summary"] or "",
             "laws": row["laws"] or "",
             "analysis": row["analysis"] or "",
+            "precedents": row["precedents"] or "",
+            "logic_audit": row["logic_audit"] or "",
             "web_sources": sources,
+            "rag_sources": rag_src,
             "characters_processed": row["characters_processed"] or 0
         }
     except Exception as e:
@@ -378,14 +417,25 @@ class GeminiLLM:
             return LLMResponse(f"[LLM Error: {str(e)}]")
 
 
-# ─── Global LLM & Agents Initialization ───────────────────────────────────────
+# ─── Global LLM, RAG & Agents Initialization ──────────────────────────────────
 gemini_rest: Optional[GeminiRESTClient] = None
 llm: Optional[GeminiLLM] = None
 multi_agent: Optional[MultiAgentOrchestrator] = None
+rag_engine: Optional[LightweightRAG] = None
 
 def init_services():
-    global gemini_rest, llm, multi_agent, GOOGLE_API_KEY
+    global gemini_rest, llm, multi_agent, rag_engine, GOOGLE_API_KEY
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
+
+    # Initialize RAG engine (independent of API key)
+    try:
+        rag_engine = LightweightRAG()
+        print(f"[OK] RAG Engine initialized: {rag_engine.num_chunks} chunks indexed")
+    except Exception as e:
+        print(f"[WARN] RAG initialization failed (non-critical): {e}")
+        rag_engine = None
+
+    # Initialize Gemini + Multi-Agent
     if GOOGLE_API_KEY:
         try:
             gemini_rest = GeminiRESTClient(api_key=GOOGLE_API_KEY)
@@ -468,9 +518,9 @@ def web_search(query: str) -> dict:
 
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Judicial AI — Gemini REST Backend",
-    version="5.1.0",
-    description="AI-powered legal analysis via Gemini REST API & Multi-Agent reasoning"
+    title="Judicial AI — Gemini REST Backend + RAG",
+    version="6.0.0",
+    description="AI-powered legal analysis via Gemini REST API, Multi-Agent reasoning & RAG"
 )
 
 app.add_middleware(
@@ -496,7 +546,7 @@ def extract_text_from_pdf(data: bytes) -> str:
 
 
 def run_analysis(text: str) -> dict:
-    global multi_agent, gemini_rest, llm
+    global multi_agent, gemini_rest, llm, rag_engine
     if not multi_agent:
         init_services()
     if not multi_agent:
@@ -504,9 +554,28 @@ def run_analysis(text: str) -> dict:
             "summary": "Backend not configured — GOOGLE_API_KEY is missing or invalid in Render Environment settings.",
             "laws": "No laws identified (Gemini API key missing).",
             "analysis": "Please configure GOOGLE_API_KEY in the deployment environment variables to enable AI analysis.",
-            "web_sources": []
+            "precedents": "",
+            "logic_audit": "",
+            "web_sources": [],
+            "rag_sources": []
         }
-    return multi_agent.run(judgment_text=text, rag_context="")
+
+    # ─── RAG Retrieval ────────────────────────────────────────────────────
+    rag_context = ""
+    rag_sources = []
+    if rag_engine and rag_engine.is_ready:
+        try:
+            rag_result = rag_engine.retrieve_for_judgment(text)
+            rag_context = rag_result.get("context", "")
+            rag_sources = rag_result.get("sources", [])
+            print(f"[RAG] Retrieved {len(rag_sources)} relevant chunks for this judgment")
+        except Exception as e:
+            print(f"[WARN] RAG retrieval error (non-critical): {e}")
+
+    # ─── Run Multi-Agent Pipeline ─────────────────────────────────────────
+    result = multi_agent.run(judgment_text=text, rag_context=rag_context)
+    result["rag_sources"] = rag_sources
+    return result
 
 
 # ─── API Endpoints ────────────────────────────────────────────────────────────
@@ -533,7 +602,10 @@ async def analyze_pdf(file: UploadFile = File(...)):
     summary = result.get("summary", "")
     laws = result.get("laws", "")
     analysis = result.get("analysis", "")
+    precedents = result.get("precedents", "")
+    logic_audit = result.get("logic_audit", "")
     web_sources = result.get("web_sources", [])
+    rag_sources = result.get("rag_sources", [])
 
     # Save to SQLite history
     record_id = save_analysis_record(
@@ -542,7 +614,10 @@ async def analyze_pdf(file: UploadFile = File(...)):
         laws=laws,
         analysis=analysis,
         web_sources=web_sources,
-        char_count=len(text)
+        char_count=len(text),
+        precedents=precedents,
+        logic_audit=logic_audit,
+        rag_sources=rag_sources
     )
 
     return {
@@ -551,7 +626,10 @@ async def analyze_pdf(file: UploadFile = File(...)):
         "summary":              summary,
         "laws":                 laws,
         "analysis":             analysis,
+        "precedents":           precedents,
+        "logic_audit":          logic_audit,
         "web_sources":          web_sources,
+        "rag_sources":          rag_sources,
         "characters_processed": len(text)
     }
 
@@ -584,11 +662,27 @@ def health():
     """Health check endpoint used by Render and frontend."""
     return {
         "status":      "online",
-        "version":     "5.1.0",
+        "version":     "6.0.0",
         "gemini":      bool(gemini_rest and gemini_rest.model),
         "multi_agent": bool(multi_agent),
+        "rag":         bool(rag_engine and rag_engine.is_ready),
+        "rag_chunks":  rag_engine.num_chunks if rag_engine else 0,
         "model":       gemini_rest.model if gemini_rest else None,
-        "api_type":    "REST (direct auto-discovery)"
+        "api_type":    "REST (direct auto-discovery) + RAG"
+    }
+
+
+@app.get("/rag/status")
+def rag_status():
+    """Status of the RAG knowledge base engine."""
+    if rag_engine:
+        return rag_engine.status()
+    return {
+        "is_ready": False,
+        "num_chunks": 0,
+        "files_loaded": [],
+        "data_dir": "",
+        "features": 0
     }
 
 
@@ -608,9 +702,10 @@ def debug_models():
 @app.get("/")
 def root():
     return {
-        "message": "Judicial AI Backend v5.1 — Dynamic Gemini REST Direct",
+        "message": "Judicial AI Backend v6.0 — Dynamic Gemini REST + RAG",
         "docs":    "/docs",
         "health":  "/health",
+        "rag":     "/rag/status",
         "debug":   "/debug/models"
     }
 
@@ -621,10 +716,11 @@ async def startup():
     init_services()
     sep = "=" * 60
     print(f"\n{sep}")
-    print("  JUDICIAL AI BACKEND v5.1 — DYNAMIC GEMINI REST DIRECT")
+    print("  JUDICIAL AI BACKEND v6.0 — GEMINI REST + RAG")
     print(sep)
     print(f"  Active Model: {gemini_rest.model if gemini_rest else 'NOT INITIALIZED'}")
     print(f"  API Type:     Direct REST (dynamic model auto-discovery)")
+    print(f"  RAG Engine:   {'Active (' + str(rag_engine.num_chunks) + ' chunks)' if rag_engine and rag_engine.is_ready else 'Inactive'}")
     print(f"  Agents:       {'5-agent pipeline ready' if multi_agent else 'Not initialized'}")
     print(f"  Web Search:   DuckDuckGo Lite (raw httpx)")
     print(f"  Database:     SQLite ({DB_PATH})")
