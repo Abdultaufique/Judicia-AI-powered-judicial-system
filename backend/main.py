@@ -25,9 +25,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_community.tools import DuckDuckGoSearchResults
-from langchain_community.vectorstores import FAISS
 from langchain_core.messages import HumanMessage
+from ddgs import DDGS
+
+# FAISS vector store (optional — only loaded if vector_store exists)
+try:
+    from langchain_community.vectorstores import FAISS
+    FAISS_AVAILABLE = True
+except ImportError:
+    FAISS_AVAILABLE = False
+    print("ℹ️  FAISS not available — RAG disabled")
 
 # --------------------------------------------------
 # BASIC SETUP
@@ -92,14 +99,19 @@ if GOOGLE_API_KEY:
         print("⚠️ Embeddings error:", e)
 
 # --------------------------------------------------
-# WEB SEARCH (DuckDuckGo — no API key needed)
+# WEB SEARCH (DuckDuckGo via ddgs — no API key needed)
 # --------------------------------------------------
-try:
-    search_tool = DuckDuckGoSearchResults(max_results=5)
-    print("✅ DuckDuckGo Search ready")
-except Exception as e:
-    search_tool = None
-    print("⚠️ DuckDuckGo error:", e)
+def ddg_search(query: str, max_results: int = 5) -> list:
+    """Direct DuckDuckGo search using ddgs library."""
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+            return results
+    except Exception as e:
+        print("⚠️ DuckDuckGo search error:", e)
+        return []
+
+print("✅ DuckDuckGo Search ready (ddgs)")
 
 # --------------------------------------------------
 # VECTOR DB (RAG) — optional, skip if not built
@@ -156,31 +168,35 @@ def web_search(query: str) -> dict:
     """
     Returns: {"answer": str, "sources": [{"title": str, "url": str, "snippet": str}]}
     """
-    if not search_tool:
-        return {"answer": "Web search unavailable", "sources": []}
-
     try:
-        raw_results = search_tool.run(query)
-        urls = extract_urls(str(raw_results))
+        raw = ddg_search(query, max_results=5)
+        if not raw:
+            return {"answer": "No web sources found", "sources": []}
 
         sources = [
-            {"title": f"Legal Source {i+1}", "url": url, "snippet": "Relevant legal precedent"}
-            for i, url in enumerate(urls)
+            {
+                "title": r.get("title", f"Legal Source {i+1}"),
+                "url": r.get("href", ""),
+                "snippet": r.get("body", "Relevant legal information")
+            }
+            for i, r in enumerate(raw) if r.get("href")
         ]
 
         if not sources:
-            return {"answer": "No web sources found", "sources": []}
+            return {"answer": "No usable web sources found", "sources": []}
 
         # Use Gemini to summarize if available
         if llm:
+            snippets = "\n".join([f"- {s['title']}: {s['snippet'][:200]}" for s in sources])
             prompt = f"""You are a legal research assistant.
 Query: {query}
-Sources: {chr(10).join([s['url'] for s in sources])}
+Search Results:
+{snippets}
 Provide a concise legal analysis (2 paragraphs max)."""
             response = llm.invoke(prompt)
             answer = response.content.strip()
         else:
-            answer = f"Found {len(sources)} sources. Gemini not available for analysis."
+            answer = f"Found {len(sources)} sources."
 
         return {"answer": answer, "sources": sources}
 
