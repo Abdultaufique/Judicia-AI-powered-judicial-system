@@ -49,22 +49,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Gemini Client ────────────────────────────────────────────────────────────
+# ─── Gemini Client (lazy — no startup ping) ──────────────────────────────────
 gemini_client = None
 if GOOGLE_API_KEY:
     try:
         gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
-        # Quick test
-        gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents="ping"
-        )
-        print(f"[OK] Gemini {GEMINI_MODEL} connected")
+        print(f"[OK] Gemini client created ({GEMINI_MODEL})")
     except Exception as e:
-        print(f"[ERR] Gemini connection failed: {e}")
+        print(f"[ERR] Gemini client init failed: {e}")
         gemini_client = None
 else:
-    print("[ERR] GOOGLE_API_KEY not set — add it in Render Environment Variables!")
+    print("[ERR] GOOGLE_API_KEY not set!")
 
 # ─── LLM Wrapper ─────────────────────────────────────────────────────────────
 class GeminiLLM:
@@ -75,7 +70,6 @@ class GeminiLLM:
         self.model  = model
 
     def invoke(self, prompt) -> LLMResponse:
-        # Accept both string and list-of-messages (from agents.py)
         if isinstance(prompt, list):
             text = "\n".join(
                 m.content if hasattr(m, "content") else str(m)
