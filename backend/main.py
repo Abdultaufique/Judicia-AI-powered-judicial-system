@@ -33,7 +33,7 @@ sys.path.append(BASE_DIR)
 load_dotenv()
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-GEMINI_MODEL   = "gemini-2.0-flash"
+GEMINI_MODEL   = "gemini-1.5-flash"
 
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 app = FastAPI(
